@@ -1,0 +1,338 @@
+FleX Compass 🧭
+
+Código fuente de FleX Compass, un proyecto de brújula digital desarrollado con un ESP32 y un sensor de orientación Tenstar BNO085.
+
+Permite consultar el rumbo y la orientación desde el celular mediante una interfaz web local.
+
+Desarrollado por: FleX Electronics
+Hardware: ESP32 DevKit V1 + Tenstar BNO085
+Entorno: Arduino IDE
+
+Puedes copiar el código, modificarlo y adaptarlo a tus propios proyectos electrónicos:
+
+/*
+  FleX Compass — brújula digital con ESP32 DevKit V1 + GY-BNO085 (I2C)
+
+  Hardware : ESP32 DevKit V1 (38 pines)  |  SDA=GPIO21  SCL=GPIO22  3V3  GND
+  Librería : "Adafruit BNO08x" (instala también Adafruit BusIO y Adafruit Unified Sensor)
+  Núcleo   : "esp32" de Espressif (Gestor de tarjetas). Placa: "ESP32 Dev Module"
+  Red      : Access Point  SSID "FleX-Compass"  clave "flex1234"  ->  http://192.168.4.1
+
+  Salida de orientación: SH2_ROTATION_VECTOR (fusión 9 ejes: acel + giro + magnetómetro,
+  referida al norte MAGNÉTICO). NO se usa el acelerómetro para el rumbo.
+  Rumbo = dirección horizontal del eje Y del sensor (calculado a partir del cuaternión,
+  por eso tolera inclinación moderada). Ver README / limitaciones.
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_BNO08x.h>
+
+// ---------------- Configuración ----------------
+#define SDA_PIN        21
+#define SCL_PIN        22
+#define I2C_CLOCK_HZ   400000          // si hay errores de lectura, prueba 100000
+
+static const char*    AP_SSID          = "FleX-Compass";
+static const char*    AP_PASS          = "flex1234";   // mínimo 8 caracteres
+static const float    HEADING_OFFSET   = 0.0f;         // grados; ajusta si el "frente" de tu placa no es el eje Y
+static const uint32_t REPORT_US        = 50000;        // 20 Hz
+static const uint32_t STALE_MS         = 1500;         // sin datos > 1,5 s => conexión perdida
+static const uint32_t RETRY_MS         = 4000;         // reintento de conexión con el sensor
+static const float    MIN_HORIZ        = 0.35f;        // si el eje Y está a >~70° de la horizontal, no hay rumbo fiable
+
+// ---------------- Estado ----------------
+enum SensorState : uint8_t { ST_ABSENT, ST_OK, ST_LOST };
+
+Adafruit_BNO08x   bno08x(-1);          // sin pin RESET (solo 4 cables)
+sh2_SensorValue_t sv;
+WebServer         server(80);
+
+static SensorState state      = ST_ABSENT;
+static uint8_t     bnoAddr    = 0;
+static bool        haveSample = false;
+static bool        flatOk     = false;
+static float       heading    = 0;     // 0..359.9, sentido horario desde el norte magnético
+static float       accErrDeg  = -1;    // estimación de precisión que informa el propio sensor
+static uint8_t     calLevel   = 0;     // 0..3 (status & 0x03 del reporte SH-2)
+static uint32_t    lastSample = 0;
+static uint32_t    lastTry    = 0;
+
+// ---------------- Página web (PROGMEM) ----------------
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14"><title>FleX Compass</title>
+<style>
+:root{--bg:#0b0f14;--card:#121923;--line:#223042;--tx:#e8eef6;--mut:#7f90a5;--acc:#3ea6ff;--red:#ff4d4d;--amb:#ffb020;--grn:#2ecc71}
+*{box-sizing:border-box;margin:0}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--tx);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100dvh;display:flex;flex-direction:column;align-items:center;padding:max(12px,env(safe-area-inset-top)) 14px max(14px,env(safe-area-inset-bottom));gap:12px;overflow-x:hidden}
+header{width:100%;max-width:440px;display:flex;justify-content:space-between;align-items:center}
+h1{font-size:18px;font-weight:700;letter-spacing:.5px}h1 span{color:var(--acc)}
+.pill{font-size:12px;padding:4px 10px;border-radius:99px;border:1px solid var(--line);color:var(--mut)}
+#banner{width:100%;max-width:440px;padding:10px 12px;border-radius:12px;font-size:14px;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--mut)}
+#banner.err{border-left-color:var(--red)}#banner.warn{border-left-color:var(--amb)}#banner.good{border-left-color:var(--grn)}#banner.info{border-left-color:var(--acc)}
+.compass{width:min(86vw,400px);aspect-ratio:1}
+.compass svg{width:100%;height:100%;display:block}
+#dial{transition:opacity .35s}body.dim #dial{opacity:.22}
+.big{text-align:center;line-height:1}
+#deg{font-size:56px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:1px}
+#card{font-size:20px;color:var(--acc);margin-top:6px;font-weight:600}
+.row{width:100%;max-width:440px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.card small{display:block;color:var(--mut);font-size:12px;margin-bottom:6px}
+.card b{font-size:17px}
+.bar{display:flex;gap:4px;margin-top:8px}.bar i{flex:1;height:6px;border-radius:3px;background:var(--line);transition:background .3s}
+button{font:inherit;font-weight:600;color:#06121f;background:var(--acc);border:0;border-radius:12px;padding:12px 18px;width:100%;max-width:440px}
+button.sec{background:var(--card);color:var(--tx);border:1px solid var(--line)}
+footer{color:var(--mut);font-size:11px;text-align:center;max-width:440px}
+#cal{position:fixed;inset:0;background:rgba(6,9,13,.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:20px;text-align:center;z-index:5}
+#cal h2{font-size:20px}#cal p{color:var(--mut);max-width:340px;font-size:15px}
+.stage{perspective:520px;width:200px;height:170px;display:flex;align-items:center;justify-content:center}
+.tilt{transform:rotateX(55deg);transform-style:preserve-3d}
+.stage.s2 .tilt,.stage.s3 .tilt{transform:none}
+.dev{width:64px;height:112px;border:2px solid var(--acc);border-radius:12px;position:relative;background:rgba(62,166,255,.08)}
+.dev b{position:absolute;left:50%;top:-10px;margin-left:-7px;border:7px solid transparent;border-top:0;border-bottom:10px solid var(--red)}
+.s0 .dev{animation:pulse 2s ease-in-out infinite}
+.s1 .dev{animation:rz 7s linear infinite}
+.s2 .dev{animation:rx 4s ease-in-out infinite alternate}
+.s3 .dev{animation:ry 4s ease-in-out infinite alternate}
+.s4 .mv{animation:fx 2s ease-in-out infinite alternate}.s4 .dev{animation:fy 1s ease-in-out infinite alternate}
+@keyframes pulse{50%{opacity:.45}}
+@keyframes rz{to{transform:rotateZ(360deg)}}
+@keyframes rx{from{transform:rotateX(-70deg)}to{transform:rotateX(70deg)}}
+@keyframes ry{from{transform:rotateY(-70deg)}to{transform:rotateY(70deg)}}
+@keyframes fx{from{transform:translateX(-45px)}to{transform:translateX(45px)}}
+@keyframes fy{from{transform:translateY(-22px) rotateZ(-12deg)}to{transform:translateY(22px) rotateZ(12deg)}}
+@media(prefers-reduced-motion:reduce){.dev,.mv{animation:none!important}}
+.dots{display:flex;gap:6px}.dots i{width:8px;height:8px;border-radius:50%;background:var(--line)}.dots i.on{background:var(--acc)}
+.calst{width:100%;max-width:320px}
+</style></head><body>
+<header><h1>FleX <span>Compass</span></h1><span class="pill" id="pill">conectando…</span></header>
+<div id="banner" class="info">Conectando con el ESP32…</div>
+<div class="compass"><svg viewBox="0 0 300 300" role="img" aria-label="Brújula">
+<circle cx="150" cy="150" r="138" fill="#0e141c" stroke="#223042" stroke-width="2"/>
+<g id="dial"></g>
+<polygon points="150,22 142,4 158,4" fill="#3ea6ff"/>
+<circle cx="150" cy="150" r="6" fill="#0b0f14" stroke="#7f90a5" stroke-width="2"/>
+</svg></div>
+<div class="big"><div id="deg">---°</div><div id="card">—</div></div>
+<div class="row">
+<div class="card"><small>Calibración (sensor)</small><b class="lv">—</b><div class="bar"><i></i><i></i><i></i></div></div>
+<div class="card"><small>Precisión estimada</small><b id="prec">—</b></div>
+</div>
+<button id="bcal">Calibrar</button>
+<footer>Rumbo magnético (norte magnético, no geográfico). Mantén el dispositivo casi horizontal y lejos de imanes, altavoces y metales.</footer>
+
+<div id="cal" hidden>
+<h2>Modo de calibración</h2>
+<div class="stage s0" id="stage"><div class="tilt"><div class="mv"><div class="dev"><b></b></div></div></div></div>
+<h2 id="st">Quieto</h2><p id="sd"></p>
+<div class="dots" id="dots"></div>
+<div class="calst card"><small>Estado de calibración informado por el sensor</small><b class="lv">—</b><div class="bar"><i></i><i></i><i></i></div></div>
+<p id="calmsg">El BNO085 calibra de forma dinámica por sí mismo. Esta pantalla solo te guía y muestra el nivel que informa; no se guarda en memoria desde este programa.</p>
+<button id="bnext" class="sec">Siguiente paso</button>
+<button id="bclose">Cerrar</button>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const NS='http://www.w3.org/2000/svg';
+function E(n,a,p){const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);if(p)p.appendChild(e);return e}
+const dial=$('dial');
+(function(){
+ for(let a=0;a<360;a+=5){const M=a%30===0,m=a%10===0,l=M?14:m?9:5;
+  E('line',{x1:150,y1:20,x2:150,y2:20+l,stroke:M?'#cfe0f2':'#4b5d73','stroke-width':M?2:1,transform:'rotate('+a+' 150 150)'},dial)}
+ for(let a=0;a<360;a+=30){if(a%90===0)continue;
+  E('text',{x:150,y:52,'text-anchor':'middle','font-size':10,fill:'#7f90a5',transform:'rotate('+a+' 150 150)'},dial).textContent=a}
+ [[0,'N'],[90,'E'],[180,'S'],[270,'O']].forEach(c=>E('text',{x:150,y:88,'text-anchor':'middle','font-size':22,'font-weight':700,fill:c[0]?'#e8eef6':'#ff4d4d',transform:'rotate('+c[0]+' 150 150)'},dial).textContent=c[1]);
+ [[45,'NE'],[135,'SE'],[225,'SO'],[315,'NO']].forEach(c=>E('text',{x:150,y:76,'text-anchor':'middle','font-size':11,fill:'#7f90a5',transform:'rotate('+c[0]+' 150 150)'},dial).textContent=c[1]);
+ E('polygon',{points:'150,104 141,150 159,150',fill:'#ff4d4d'},dial);
+ E('polygon',{points:'150,196 141,150 159,150',fill:'#cfe0f2'},dial);
+})();
+
+const LV=['No fiable','Baja','Media','Alta'],COL=['#ff4d4d','#ff8a3d','#ffd23d','#2ecc71'];
+const CARD=['N','NE','E','SE','S','SO','O','NO'];
+let tgt=null,cur=0,init=false,fails=0,off=false,last=null,lastR='',highSince=0,calOpen=false;
+
+function banner(t,c){const b=$('banner');if(b.textContent!==t)b.textContent=t;b.className=c}
+function setCal(c,e){
+ const lbl=c>=0?LV[c]:'—';
+ document.querySelectorAll('.lv').forEach(x=>{x.textContent=lbl;x.style.color=c>=0?COL[c]:''});
+ document.querySelectorAll('.bar').forEach(b=>[...b.children].forEach((i,k)=>i.style.background=(c>=k+1)?COL[c]:''));
+ $('prec').textContent=(typeof e==='number')?'±'+e.toFixed(1)+'°':'—';
+}
+function status(){
+ const d=last;let live=false,c=-1;
+ if(off||!d){banner('Sin conexión con el ESP32. Comprueba que sigues en la red Wi-Fi "FleX-Compass".','err');$('pill').textContent='sin enlace'}
+ else if(d.s==='absent'){banner('BNO085 no detectado en I²C (0x4A / 0x4B). Revisa 3V3, GND, SDA→GPIO21 y SCL→GPIO22.','err');$('pill').textContent='sin sensor'}
+ else if(d.s==='lost'){banner('Se perdió la comunicación con el BNO085. Reintentando automáticamente…','err');$('pill').textContent='sensor perdido'}
+ else if(d.s==='wait'){banner('Sensor detectado. Esperando las primeras lecturas…','info');$('pill').textContent='iniciando'}
+ else{
+  c=d.c;$('pill').textContent='0x'+d.addr.toString(16).toUpperCase();
+  if(typeof d.h!=='number')banner('Inclinación excesiva: sostén el dispositivo casi horizontal para obtener el rumbo.','warn');
+  else{live=true;
+   if(c<=1)banner('Necesita calibración ('+LV[c].toLowerCase()+'). Pulsa «Calibrar» y sigue las instrucciones.','warn');
+   else if(c===2)banner('Calibración media: la lectura es utilizable y mejora con más movimiento.','info');
+   else banner('Calibración alta.','good')}
+ }
+ tgt=live?d.h:null;if(!live){init=false;lastR='';$('deg').textContent='---°';$('card').textContent='—'}
+ document.body.classList.toggle('dim',!live);
+ setCal(c,d&&!off&&d.s==='ok'?d.e:null);
+ if(calOpen)calStatus(c)
+}
+function onData(d){fails=0;off=false;last=d;status()}
+async function poll(){
+ const ac=new AbortController(),t=setTimeout(()=>ac.abort(),1500);
+ try{const r=await fetch('/api/data',{cache:'no-store',signal:ac.signal});clearTimeout(t);onData(await r.json())}
+ catch(e){clearTimeout(t);if(++fails>=3&&!off){off=true;status()}}
+ setTimeout(poll,100)
+}
+function frame(){
+ if(tgt!==null){
+  if(!init){cur=tgt;init=true}
+  else{const d=((tgt-cur+540)%360)-180;cur=(cur+d*0.22+360)%360}
+  const r=cur.toFixed(1);
+  if(r!==lastR){lastR=r;
+   dial.setAttribute('transform','rotate('+(-cur).toFixed(2)+' 150 150)');
+   $('deg').textContent=String(Math.round(cur)%360).padStart(3,'0')+'°';
+   $('card').textContent=CARD[Math.round(cur/45)%8]}
+ }
+ requestAnimationFrame(frame)
+}
+
+// ---- Calibración ----
+const STEPS=[
+ ['Quieto','Apoya el dispositivo inmóvil sobre una superficie plana durante 3 segundos.'],
+ ['Giro plano','Gíralo despacio sobre la mesa, una vuelta completa (unos 10 s).'],
+ ['Cabeceo','Inclínalo hacia delante y atrás, lento, unos 70° a cada lado.'],
+ ['Alabeo','Inclínalo a izquierda y derecha, lento, unos 70° a cada lado.'],
+ ['Figura en 8','Dibuja un 8 grande en el aire girando la muñeca, lejos de metales e imanes.']];
+let step=0,tmr=null;
+$('dots').innerHTML=STEPS.map(()=>'<i></i>').join('');
+function showStep(){
+ $('stage').className='stage s'+step;$('st').textContent=(step+1)+'/'+STEPS.length+' · '+STEPS[step][0];$('sd').textContent=STEPS[step][1];
+ [...$('dots').children].forEach((d,k)=>d.className=k===step?'on':'')
+}
+function calStatus(c){
+ if(c===3){if(!highSince)highSince=Date.now();
+  $('calmsg').textContent=(Date.now()-highSince>3000)?'Calibración alta estable. Puedes cerrar.':'Calibración alta. Mantén un momento para confirmar…'}
+ else{highSince=0;
+  $('calmsg').textContent=(c<0)?'Sin datos del sensor: revisa el aviso en la pantalla principal.':'El BNO085 calibra de forma dinámica por sí mismo. Esta pantalla solo te guía; no se guarda en memoria desde este programa.'}
+}
+function openCal(){calOpen=true;step=0;highSince=0;showStep();$('cal').hidden=false;tmr=setInterval(()=>{step=(step+1)%STEPS.length;showStep()},7000);status()}
+function closeCal(){calOpen=false;$('cal').hidden=true;clearInterval(tmr)}
+$('bcal').onclick=openCal;$('bclose').onclick=closeCal;
+$('bnext').onclick=()=>{step=(step+1)%STEPS.length;showStep();clearInterval(tmr);tmr=setInterval(()=>{step=(step+1)%STEPS.length;showStep()},7000)};
+
+status();poll();requestAnimationFrame(frame);
+</script></body></html>)rawliteral";
+
+// ---------------- I2C / sensor ----------------
+static bool i2cAck(uint8_t a) {
+  Wire.beginTransmission(a);
+  return Wire.endTransmission() == 0;
+}
+
+// Busca el BNO085 en 0x4A / 0x4B, lo inicia y activa el reporte de vector de rotación.
+static bool connectSensor() {
+  const uint8_t addrs[2] = {0x4A, 0x4B};
+  for (uint8_t i = 0; i < 2; i++) {
+    uint8_t a = addrs[i];
+    if (!i2cAck(a)) continue;
+    if (!bno08x.begin_I2C(a, &Wire)) { Serial.printf("BNO08x responde en 0x%02X pero begin_I2C fallo\n", a); continue; }
+    Wire.setClock(I2C_CLOCK_HZ);
+    if (!bno08x.enableReport(SH2_ROTATION_VECTOR, REPORT_US)) { Serial.println("enableReport(SH2_ROTATION_VECTOR) fallo"); continue; }
+    bnoAddr = a;
+    haveSample = false;
+    lastSample = millis();
+    Serial.printf("BNO08x listo en 0x%02X\n", a);
+    return true;
+  }
+  return false;
+}
+
+static void pollSensor() {
+  uint32_t now = millis();
+  if (state == ST_OK) {
+    if (bno08x.wasReset()) {                       // el sensor se reinició: hay que volver a pedir el reporte
+      Serial.println("BNO08x se reinicio; reactivando reporte");
+      bno08x.enableReport(SH2_ROTATION_VECTOR, REPORT_US);
+    }
+    for (uint8_t n = 0; n < 8 && bno08x.getSensorEvent(&sv); n++) {
+      if (sv.sensorId != SH2_ROTATION_VECTOR) continue;
+      float w = sv.un.rotationVector.real, x = sv.un.rotationVector.i;
+      float y = sv.un.rotationVector.j,    z = sv.un.rotationVector.k;
+      // Eje Y del sensor expresado en el mundo (X=Este, Y=Norte, Z=Arriba)
+      float east  = 2.0f * (x * y - w * z);
+      float north = 1.0f - 2.0f * (x * x + z * z);
+      flatOk = (sqrtf(east * east + north * north) >= MIN_HORIZ);
+      if (flatOk) {
+        float h = atan2f(east, north) * RAD_TO_DEG + HEADING_OFFSET;
+        h = fmodf(h, 360.0f); if (h < 0) h += 360.0f;
+        heading = h;
+      }
+      calLevel  = sv.status & 0x03;                          // exactitud SH-2: 0..3
+      accErrDeg = sv.un.rotationVector.accuracy * RAD_TO_DEG; // estimación del propio sensor
+      haveSample = true;
+      lastSample = now;
+    }
+    if (now - lastSample > STALE_MS) {
+      state = ST_LOST; haveSample = false; lastTry = now;
+      Serial.println("BNO08x: sin datos, conexion perdida");
+    }
+  } else if (now - lastTry >= RETRY_MS) {
+    lastTry = now;
+    if (connectSensor()) state = ST_OK;
+  }
+}
+
+// ---------------- HTTP ----------------
+static void handleRoot() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+static void handleData() {
+  char hb[12], eb[12], out[160];
+  const char* s = (state == ST_ABSENT) ? "absent" : (state == ST_LOST) ? "lost" : (haveSample ? "ok" : "wait");
+  bool valid = (state == ST_OK && haveSample);
+  if (valid && flatOk) snprintf(hb, sizeof hb, "%.1f", heading); else strcpy(hb, "null");
+  if (valid && accErrDeg >= 0 && accErrDeg < 360) snprintf(eb, sizeof eb, "%.1f", accErrDeg); else strcpy(eb, "null");
+  snprintf(out, sizeof out, "{\"s\":\"%s\",\"h\":%s,\"c\":%d,\"e\":%s,\"age\":%lu,\"addr\":%u}",
+           s, hb, valid ? (int)calLevel : -1, eb,
+           valid ? (unsigned long)(millis() - lastSample) : 0UL, (unsigned)bnoAddr);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", out);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\nFleX Compass");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(200);                                  // el BNO085 tarda un poco en arrancar
+  if (connectSensor()) state = ST_OK;
+  else Serial.println("BNO085 no detectado (se reintentara)");
+  lastTry = millis();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 2);      // canal 1, visible, máx. 2 clientes
+  Serial.print("AP: "); Serial.print(AP_SSID); Serial.print("  IP: "); Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/data", HTTP_GET, handleData);
+  server.onNotFound([]() { server.send(404, "text/plain", "404"); });
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  pollSensor();
+  delay(1);
+}
